@@ -8,5 +8,8 @@
     "phoneLogin": "node phoneLogin.js",
     "sent": "node sent.js",
     "qrcodeLogin": "node qrcodeLogin.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.3"
   }
 }

@@ -36,13 +36,37 @@ function close_api(api) {
   }
 }
 
-/** 发送请求到本地 api 服务 */
+/**
+ * 发送请求到本地 api 服务（带超时 + 重试）
+ * 超时 10 秒，失败后指数退避重试最多 3 次
+ */
 async function send(path, method, headers) {
-  const result = await fetch('http://127.0.0.1:3000' + path, {
-    method,
-    headers,
-  }).then(r => r.json())
-  return result
+  const MAX_RETRIES = 3
+  const TIMEOUT_MS = 10000
+  let lastError
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
+    try {
+      const resp = await fetch('http://127.0.0.1:3000' + path, {
+        method,
+        headers,
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
+      return await resp.json()
+    } catch (err) {
+      clearTimeout(timer)
+      lastError = err
+      if (attempt < MAX_RETRIES - 1) {
+        const waitMs = 1000 * Math.pow(2, attempt) // 1s, 2s, 4s
+        console.log(`[send] 第 ${attempt + 1} 次请求失败，${waitMs}ms 后重试: ${err.message}`)
+        await delay(waitMs)
+      }
+    }
+  }
+  throw lastError
 }
 
 export { delay, startService, close_api, send }

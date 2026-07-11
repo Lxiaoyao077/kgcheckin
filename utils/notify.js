@@ -101,7 +101,7 @@ async function sendServerChan(title, content, sendkey) {
 
 // 6. PushPlus
 async function sendPushPlus(title, content, token, topic) {
-  const url = 'http://www.pushplus.plus/send'
+  const url = 'https://www.pushplus.plus/send'
   const body = { token, title, content, template: 'txt' }
   if (topic) body.topic = topic
   const resp = await fetch(url, {
@@ -150,7 +150,8 @@ async function sendDiscord(title, content, webhookUrl) {
   return resp.ok
 }
 
-// 10. 邮箱 SMTP（使用 node:tls 实现最小 SMTP 客户端）
+// 10. 邮箱 SMTP（使用 node:net/node:tls 实现最小 SMTP 客户端）
+// 支持隐式 TLS（端口 465）和 STARTTLS（端口 587/25）
 function sendMailSMTP(title, content, cfg) {
   return new Promise((resolve, reject) => {
     const { host, port, user, pass, to } = cfg
@@ -172,9 +173,22 @@ function sendMailSMTP(title, content, cfg) {
       content,
     ].join('\r\n')
 
-    const lines = [
-      `EHLO kgcheckin`,
-      `AUTH LOGIN`,
+    // 隐式 TLS (465) 直接 TLS 连接；STARTTLS (587/25) 先明文再升级
+    const smtpPort = Number(port) || 465
+    const useSTARTTLS = smtpPort !== 465
+
+    // SMTP 会话状态机
+    // 隐式 TLS:  GREETING → EHLO_SENT → AUTH 流程
+    // STARTTLS:  GREETING → EHLO_SENT → STARTTLS_SENT → TLS_UPGRADED → EHLO2_SENT → AUTH 流程
+    let state = 'GREETING'
+    let buffer = ''
+    let socket
+    let tlsSocket
+    let timer
+
+    // AUTH 流程命令序列（EHLO 之后依次执行）
+    const authCommands = [
+      'AUTH LOGIN',
       Buffer.from(user).toString('base64'),
       Buffer.from(pass).toString('base64'),
       `MAIL FROM:<${from}>`,
@@ -183,46 +197,108 @@ function sendMailSMTP(title, content, cfg) {
       mailBody.replace(/\r?\n/g, '\r\n') + '\r\n.',
       'QUIT',
     ]
+    let authStep = 0
 
-    let step = 0
-    let buffer = ''
-    const socket = tls.connect(
-      { host, port: Number(port) || 465, rejectUnauthorized: true },
-      () => {}
-    )
+    function sendCmd(cmd) {
+      socket.write(cmd + '\r\n')
+    }
 
-    socket.setEncoding('utf8')
-    socket.on('data', (chunk) => {
+    function processData(line) {
+      const code = parseInt(line.slice(0, 3), 10)
+
+      if (code >= 400) {
+        socket.destroy()
+        reject(new Error(`SMTP 错误: ${line}`))
+        return
+      }
+
+      // 等待多行响应结束（中间行以 "code-" 开头，最后一行以 "code " 开头）
+      if (line[3] === '-') return
+
+      switch (state) {
+        case 'GREETING':
+          // 收到 220 服务器就绪 → 发送 EHLO
+          sendCmd('EHLO kgcheckin')
+          state = 'EHLO_SENT'
+          break
+
+        case 'EHLO_SENT':
+          if (useSTARTTLS) {
+            // STARTTLS 模式：EHLO 响应后发送 STARTTLS
+            sendCmd('STARTTLS')
+            state = 'STARTTLS_SENT'
+          } else {
+            // 隐式 TLS：直接进入 AUTH 流程
+            state = 'AUTH'
+            authStep = 0
+            sendCmd(authCommands[authStep++])
+          }
+          break
+
+        case 'STARTTLS_SENT':
+          // 收到 220 → 升级为 TLS
+          if (code !== 220) {
+            socket.destroy()
+            reject(new Error(`STARTTLS 失败: ${line}`))
+            return
+          }
+          tlsSocket = require('node:tls').connect({ socket, host, rejectUnauthorized: true })
+          tlsSocket.setEncoding('utf8')
+          tlsSocket.on('data', (chunk) => { handleChunk(chunk) })
+          tlsSocket.on('end', () => { clearTimeout(timer); resolve(true) })
+          tlsSocket.on('close', () => { clearTimeout(timer); resolve(true) })
+          tlsSocket.on('error', (err) => { clearTimeout(timer); reject(err) })
+          socket = tlsSocket
+          // 升级后重新发送 EHLO
+          sendCmd('EHLO kgcheckin')
+          state = 'EHLO2_SENT'
+          break
+
+        case 'EHLO2_SENT':
+          // STARTTLS 升级后的第二次 EHLO 响应 → 进入 AUTH 流程
+          state = 'AUTH'
+          authStep = 0
+          sendCmd(authCommands[authStep++])
+          break
+
+        case 'AUTH':
+          if (authStep < authCommands.length) {
+            sendCmd(authCommands[authStep++])
+          }
+          break
+      }
+    }
+
+    function handleChunk(chunk) {
       buffer += chunk
       while (true) {
         const idx = buffer.indexOf('\r\n')
         if (idx === -1) break
         const line = buffer.slice(0, idx)
         buffer = buffer.slice(idx + 2)
-        const code = parseInt(line.slice(0, 3), 10)
-
-        if (code >= 400) {
-          socket.destroy()
-          reject(new Error(`SMTP 错误: ${line}`))
-          return
-        }
-
-        // 等待多行响应结束（最后一行以 "code " 开头，中间行以 "code-" 开头）
-        if (line[3] === '-') continue
-
-        if (step < lines.length) {
-          socket.write(lines[step] + '\r\n')
-          step++
-        }
+        processData(line)
       }
-    })
+    }
 
     // 超时保护
-    const timer = setTimeout(() => {
-      socket.destroy()
+    timer = setTimeout(() => {
+      if (socket) socket.destroy()
       reject(new Error('SMTP 超时'))
     }, 15000)
 
+    if (useSTARTTLS) {
+      // STARTTLS：先明文连接
+      socket = require('node:net').connect(smtpPort, host, () => {})
+    } else {
+      // 隐式 TLS：直接 TLS 连接
+      socket = require('node:tls').connect(
+        { host, port: smtpPort, rejectUnauthorized: true },
+        () => {}
+      )
+    }
+
+    socket.setEncoding('utf8')
+    socket.on('data', (chunk) => handleChunk(chunk))
     socket.on('end', () => { clearTimeout(timer); resolve(true) })
     socket.on('close', () => { clearTimeout(timer); resolve(true) })
     socket.on('error', (err) => { clearTimeout(timer); reject(err) })

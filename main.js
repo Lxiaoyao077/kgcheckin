@@ -140,6 +140,7 @@ async function main() {
   }
 
   // 更新secret <USERINFO>（使用完整 userinfo 数组，保留所有用户包括过期账号）
+  let secretError = null
   if (needRefresh) {
     if (hasSecretWriteToken()) {
       const userinfoJSON = JSON.stringify(userinfo)
@@ -149,14 +150,14 @@ async function main() {
       } catch (error) {
         printRed("token刷新失败")
         console.dir(sanitizeForLog({ message: error.message }), { depth: null })
-        throw new Error("secret <USERINFO> token刷新失败")
+        secretError = new Error("secret <USERINFO> token刷新失败")
       }
     } else {
       printYellow("存在账号需要刷新token，但是未配置PAT，未刷新token最多两个月后过期")
     }
   }
 
-  // 构建通知内容
+  // 构建通知内容（放在 secret 更新之后、错误抛出之前，确保始终执行）
   const title = `酷狗签到${hasError ? '异常' : '成功'} ${date}`
   let content = `📅 日期: ${date}\n`
   content += `📊 账号数: ${notifyResults.length}\n`
@@ -174,7 +175,7 @@ async function main() {
     }
   }
 
-  // 发送通知
+  // 发送通知（确保即使 secret 更新失败也能发出）
   try {
     await sendNotify(title, content)
   } catch (e) {
@@ -185,6 +186,10 @@ async function main() {
     printRed("异常信息如下:")
     console.dir(sanitizeForLog(errorMsg), { depth: null })
     throw new Error("领取异常")
+  }
+
+  if (secretError) {
+    throw secretError
   }
 
 }

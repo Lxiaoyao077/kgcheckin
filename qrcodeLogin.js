@@ -260,7 +260,8 @@ async function waitMode() {
         if (i === 29) {
           printRed("等待超时\n")
         }
-        await delay(5000)
+        // 前 10 次用 3 秒间隔（快速响应），之后用 5 秒间隔
+        await delay(i < 10 ? 3000 : 5000)
       }
       results.push({
         index: n + 1,
